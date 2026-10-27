@@ -236,6 +236,7 @@ class BatchConversationCache {
     if (!bytes || bytes > cache_.Budget()) return Refuse("budget");
     const uint64_t parent = Parent(hist, policy);  // before eviction can remove it
     const bool proven = ExtendsProven(hist, policy);  // also before eviction
+    RetireDeadBranches(hist, prompt_tokens < hist.size() ? prompt_tokens : 0, &policy);
     const auto marked = trusted ? Supersede(hist, policy, [](const Entry& entry) {
       return entry.retention == CacheRetention::Session;
     }) : std::set<const Item*>{};
@@ -274,6 +275,7 @@ class BatchConversationCache {
     // A tail is never superseded by a prompt frontier: replay makes it the most valuable entry (G15).
     // A speculative frontier (past the boundary) is a speculative tail: a retry of this prompt, or a next turn that
     // drops the reasoning, cannot use it. It marks nothing until a hit confirms it.
+    if (!frontier.speculative) RetireDeadBranches(ids.first(frontier.position), frontier.position, &policy);
     const auto marked = frontier.speculative ? std::set<const Item*>{} :
         Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
           return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
@@ -428,6 +430,8 @@ class BatchConversationCache {
   }
   size_t Evictions() const { return cache_.Evictions(); }
   size_t SupersededEvictions() const { return cache_.SupersededEvictions(); }
+  // Tails marked as dead branches (RetireDeadBranches), cumulative.
+  size_t DeadBranches() const { return dead_branches_; }
   // Rounds of saves and hits (those not on probation) after which a session with no new save or hit counts as idle.
   static constexpr uint64_t kIdleRounds = 16;
   // A resume point that no request used for this long (wall clock) is idle too (a review: with probation, the
@@ -690,7 +694,51 @@ class BatchConversationCache {
     return clock_now_ ? clock_now_()
                       : std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
+  // A tail is a dead branch when a later client prompt of its conversation already contradicts its generated tokens:
+  // the client sent its own version of that reply (many drop the reasoning), so no prompt that continues the
+  // conversation repeats this tail, and FindTail and Find never match it again. It leaves first and stays off the
+  // disk, as a superseded entry, and it is no session's resume point any more. Before this, such tails stayed the
+  // protected heads of a growing conversation: after one miss its next tails are untrusted and supersede nothing, so
+  // every save of that conversation was refused as "protected" and each turn re-prefilled the whole prompt.
+  // Only a key whose client-prompt part is known counts as the contradicting prompt: a frontier (prompt tokens only),
+  // or a tail saved with its request's prompt length. A handover copy records no prompt, so it never decides.
+  // A hit clears the mark (PrefixCache::FindEntry), as for any superseded entry.
+  // Whether a client prompt (`ids`, its first `prompt` tokens sent by the client) contradicts `tail`'s reply.
+  static bool Contradicts(const Item& tail, std::span<const int> ids, size_t prompt) {
+    const size_t own = tail.snapshot->prompt;
+    const size_t limit = std::min({prompt, ids.size(), tail.ids.size()});  // what that client prompt covers
+    if (limit <= own || ids[own - 1] != tail.ids[own - 1]) return false;  // another conversation, or no reply yet
+    const size_t common = size_t(std::mismatch(tail.ids.begin(), tail.ids.begin() + limit, ids.begin()).first -
+                                 tail.ids.begin());
+    return common >= own && common < limit;  // the same prompt, then the client wrote a different reply
+  }
+  // `ids`/`prompt`: the key of the save in progress and its client-prompt length (0: unknown), checked as a later
+  // prompt too, since it is in no entry yet.
+  void RetireDeadBranches(std::span<const int> ids = {}, size_t prompt = 0, const ConversationPolicy* policy = nullptr) {
+    std::vector<Item*> tails, prompts;
+    cache_.ForEach([&](Item& item) {
+      const auto& entry = *item.snapshot;
+      if (entry.retention != CacheRetention::Session) return;
+      const bool frontier = entry.snapshot->resume.prompt_only;
+      // A frontier is client prompt tokens once a client prompt showed it (a speculative one is not, until a hit).
+      if ((frontier && item.confirmed) || (!frontier && entry.prompt < item.ids.size())) prompts.push_back(&item);
+      if (!item.superseded && !frontier && entry.prompt && entry.prompt < item.ids.size()) tails.push_back(&item);
+    });
+    for (Item* tail : tails) {
+      bool dead = prompt && policy && tail->policy == *policy && Contradicts(*tail, ids, prompt);
+      for (const Item* other : prompts) {
+        if (dead) break;
+        if (other == tail || other->policy != tail->policy || other->snapshot->serial <= tail->snapshot->serial) continue;
+        dead = Contradicts(*tail, other->ids, other->snapshot->prompt ? other->snapshot->prompt : other->ids.size());
+      }
+      if (dead) {
+        tail->superseded = true;
+        ++dead_branches_;
+      }
+    }
+  }
   std::map<const Item*, int> Plan() {
+    RetireDeadBranches();
     const double now = Now();
     std::vector<Item*> heads, confirmed;
     std::set<const Item*> copies;
@@ -874,6 +922,7 @@ class BatchConversationCache {
   uint64_t clock_ = 0;
   const char* refusal_ = "host";
   uint64_t attempts_ = 0, serials_ = 0;
+  size_t dead_branches_ = 0;  // RetireDeadBranches marks, cumulative
   BatchCacheSave last_;
   struct Victim {
     std::vector<int> key;

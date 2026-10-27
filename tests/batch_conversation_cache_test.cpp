@@ -1080,6 +1080,52 @@ static void LatestRefusal() {
   assert(c.cache.LastRefusal() == std::string("protected"));
 }
 
+
+// A tail that a later client prompt contradicts (the client sent its own version of the reply, e.g. without the
+// reasoning) is a dead branch: it stops being a protected resume point and leaves first. Before, a growing
+// conversation kept such tails as its live heads, and after one miss each untrusted save was refused as "protected".
+static void DeadBranchTails() {
+  const auto x = Tokens(1, 40), y = Tokens(101, 40);
+  const uint64_t ram = uint64_t(9) << 30;
+  // The client's next prompt keeps x's first 18 tokens: its prompt (16) and 2 of the 5 generated ones, then differs.
+  const auto next = Fork(x, 18, 500);
+  {
+    Cache c(2, 2);
+    assert(c.Tail(x, 21, true, false, false, ram, 16));                 // trusted: x's resume point
+    assert(c.Capture(y, 16, CacheRetention::Session));                  // y's resume point: the budget is full
+    assert(c.Tail(next, 30, false, false, false, ram, 25));             // untrusted: x's dead tail makes the room
+    assert(c.cache.DeadBranches() == 1 && c.cache.SupersededEvictions() == 1);
+    assert(c.HitTail(x) == 0 && c.Hit(y) == 16 && c.HitTail(Fork(next, 30, 700)) == 30);
+  }
+  {
+    // The client repeated the whole reply: the tail lives on (the later key extends it), the save is refused as before.
+    Cache c(2, 2);
+    assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
+    assert(!c.Tail(x, 30, false, false, false, ram, 25) && c.cache.Status().last.refused == "protected");
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(x) == 21);
+  }
+  {
+    // The difference lies in the later request's own generated tokens, past its client prompt: no proof, no mark.
+    Cache c(2, 2);
+    assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
+    assert(!c.Tail(next, 30, false, false, false, ram, 17) && c.cache.Status().last.refused == "protected");
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(x) == 21);
+  }
+  {
+    // A handover copy records no prompt length, so it never decides; neither does a tail of another conversation.
+    Cache c(2, 2);
+    assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
+    assert(!c.Tail(next, 30) && c.cache.Status().last.refused == "protected");
+    assert(!c.Tail(Fork(y, 0, 900), 30, false, false, false, ram, 25) && c.cache.DeadBranches() == 0);
+  }
+  {
+    // A later frontier (prompt tokens only) contradicts the tail as well.
+    Cache c(2, 3);
+    assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
+    assert(c.Capture(next, 24, CacheRetention::Session) && c.cache.DeadBranches() == 1);
+  }
+}
+
 int main() {
   TenantsNeverShareRam();
   LocalTenantUnchanged();
@@ -1103,6 +1149,7 @@ int main() {
   KeyedEntries();
   TailRules();
   SessionRules();
+  DeadBranchTails();
   MissedTail();
   Peek();
   ResidentRules();
